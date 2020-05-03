@@ -56,7 +56,8 @@ class _TestUDP:
 
         s_transport, server = self.loop.run_until_complete(coro)
 
-        host, port, *_ = s_transport.get_extra_info('sockname')
+        remote_addr = s_transport.get_extra_info('sockname')
+        host, port, *_ = remote_addr
 
         self.assertIsInstance(server, TestMyDatagramProto)
         self.assertEqual('INITIALIZED', server.state)
@@ -86,6 +87,36 @@ class _TestUDP:
         # received
         self.assertEqual(8, client.nbytes)
 
+        # https://github.com/MagicStack/uvloop/issues/319
+        # uvloop should behave the same as asyncio when given remote_addr
+        transport.sendto(b'xxx', remote_addr)
+        tb.run_until(
+            self.loop, lambda: server.nbytes > 3 or client.done.done())
+        self.assertEqual(6, server.nbytes)
+        tb.run_until(self.loop, lambda: client.nbytes > 8)
+
+        # received
+        self.assertEqual(16, client.nbytes)
+
+        # reject sendto with a different port
+        with self.assertRaisesRegex(
+            ValueError, "Invalid address.*" + repr(remote_addr)
+        ):
+            bad_addr = list(remote_addr)
+            bad_addr[1] += 1
+            bad_addr = tuple(bad_addr)
+            transport.sendto(b"xxx", bad_addr)
+
+        # reject sento with unresolved hostname
+        if remote_addr[0] != lc_addr[0]:
+            with self.assertRaisesRegex(
+                ValueError, "Invalid address.*" + repr(remote_addr)
+            ):
+                bad_addr = list(remote_addr)
+                bad_addr[0] = lc_addr[0]
+                bad_addr = tuple(bad_addr)
+                transport.sendto(b"xxx", bad_addr)
+
         # extra info is available
         self.assertIsNotNone(transport.get_extra_info('sockname'))
 
@@ -100,8 +131,11 @@ class _TestUDP:
         self._test_create_datagram_endpoint_addrs(
             socket.AF_INET, ('127.0.0.1', 0))
 
-    @unittest.skipUnless(tb.has_IPv6, 'no IPv6')
-    def test_create_datagram_endpoint_addrs_ipv6(self):
+    def test_create_datagram_endpoint_addrs_ipv4_nameaddr(self):
+        self._test_create_datagram_endpoint_addrs(
+            socket.AF_INET, ('localhost', 0))
+
+    def _test_create_datagram_endpoint_addrs_ipv6(self):
         self._test_create_datagram_endpoint_addrs(
             socket.AF_INET6, ('::1', 0))
 
@@ -250,6 +284,50 @@ class _TestUDP:
 
         self.loop.run_until_complete(run())
 
+    def test_socketpair(self):
+        peername = asyncio.Future(loop=self.loop)
+
+        class Proto(MyDatagramProto):
+            def datagram_received(self, data, addr):
+                super().datagram_received(data, addr)
+                peername.set_result(addr)
+
+        s1, s2 = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM, 0)
+
+        with s1, s2:
+            try:
+                f = self.loop.create_datagram_endpoint(
+                    lambda: Proto(loop=self.loop), sock=s1)
+            except TypeError as ex:
+                # asyncio in 3.5.0 doesn't have the 'sock' argument
+                if 'got an unexpected keyword argument' not in ex.args[0]:
+                    raise
+            else:
+                tr, pr = self.loop.run_until_complete(f)
+                self.assertIsInstance(pr, Proto)
+
+                s2.send(b'hello, socketpair')
+                addr = self.loop.run_until_complete(
+                    asyncio.wait_for(peername, 1, loop=self.loop))
+                if sys.platform.startswith('linux'):
+                    self.assertEqual(addr, None)
+                else:
+                    self.assertEqual(addr, '')
+                self.assertEqual(pr.nbytes, 17)
+
+                if not self.is_asyncio_loop():
+                    # asyncio doesn't support sendto(xx) on UDP sockets
+                    # https://git.io/Jfqbw
+                    data = b'from uvloop'
+                    tr.sendto(data)
+                    result = self.loop.run_until_complete(asyncio.wait_for(
+                        self.loop.run_in_executor(None, s2.recv, 1024),
+                        1, loop=self.loop))
+                    self.assertEqual(data, result)
+
+                tr.close()
+                self.loop.run_until_complete(pr.done)
+
 
 class Test_UV_UDP(_TestUDP, tb.UVTestCase):
 
@@ -291,6 +369,16 @@ class Test_UV_UDP(_TestUDP, tb.UVTestCase):
         self.loop.run_until_complete(asyncio.sleep(0.01))
         s_transport.sendto(b'aaaa', ('127.0.0.1', 80))
 
+    @unittest.skipUnless(tb.has_IPv6, 'no IPv6')
+    def test_create_datagram_endpoint_addrs_ipv6(self):
+        self._test_create_datagram_endpoint_addrs_ipv6()
+
 
 class Test_AIO_UDP(_TestUDP, tb.AIOTestCase):
-    pass
+    @unittest.skipUnless(tb.has_IPv6, 'no IPv6')
+    @unittest.skipIf(
+        sys.version_info[:3] < (3, 6, 7) or sys.version_info[:3] == (3, 7, 0),
+        'bpo-27500: bug fixed in Python 3.6.7, 3.7.1 and above.',
+    )
+    def test_create_datagram_endpoint_addrs_ipv6(self):
+        self._test_create_datagram_endpoint_addrs_ipv6()

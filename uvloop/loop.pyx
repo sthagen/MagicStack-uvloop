@@ -1386,16 +1386,29 @@ cdef class Loop:
         """Create a Future object attached to the loop."""
         return self._new_future()
 
-    def create_task(self, coro):
+    def create_task(self, coro, *, name=None):
         """Schedule a coroutine object.
 
         Return a task object.
+
+        If name is not None, task.set_name(name) will be called if the task
+        object has the set_name attribute, true for default Task in Python 3.8.
         """
         self._check_closed()
         if self._task_factory is None:
             task = aio_Task(coro, loop=self)
         else:
             task = self._task_factory(self, coro)
+
+        # copied from asyncio.tasks._set_task_name (bpo-34270)
+        if name is not None:
+            try:
+                set_name = task.set_name
+            except AttributeError:
+                pass
+            else:
+                set_name(name)
+
         return task
 
     def set_task_factory(self, factory):
@@ -3004,6 +3017,7 @@ cdef class Loop:
                     rai = (<AddrInfo>rads).data
                     udp._init(self, rai.ai_family)
                     udp._connect(rai.ai_addr, rai.ai_addrlen)
+                    udp._set_address(rai)
                 else:
                     if family not in (uv.AF_INET, uv.AF_INET6):
                         raise ValueError('unexpected address family')
@@ -3047,6 +3061,7 @@ cdef class Loop:
                             rai = rai.ai_next
                             continue
                         udp._connect(rai.ai_addr, rai.ai_addrlen)
+                        udp._set_address(rai)
                         break
                     else:
                         raise OSError(

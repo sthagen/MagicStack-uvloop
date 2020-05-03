@@ -55,6 +55,7 @@ cdef class UDPTransport(UVBaseTransport):
     def __cinit__(self):
         self._family = uv.AF_UNSPEC
         self.__receiving = 0
+        self._address = None
 
     cdef _init(self, Loop loop, unsigned int family):
         cdef int err
@@ -77,6 +78,9 @@ cdef class UDPTransport(UVBaseTransport):
             self._family = family
 
         self._finish_init()
+
+    cdef _set_address(self, system.addrinfo *addr):
+        self._address = __convert_sockaddr_to_pyaddr(addr.ai_addr)
 
     cdef _connect(self, system.sockaddr* addr, size_t addr_len):
         cdef int err
@@ -279,6 +283,16 @@ cdef class UDPTransport(UVBaseTransport):
             # Replicating asyncio logic here.
             return
 
+        if self._address:
+            if addr not in (None, self._address):
+                # Replicating asyncio logic here.
+                raise ValueError(
+                    'Invalid address: must be None or %s' % (self._address,))
+
+            # Instead of setting addr to self._address below like what asyncio
+            # does, we depend on previous uv_udp_connect() to set the address
+            addr = None
+
         if self._conn_lost:
             # Replicating asyncio logic here.
             if self._conn_lost >= LOG_THRESHOLD_FOR_CONNLOST_WRITES:
@@ -330,6 +344,12 @@ cdef void __uv_udp_on_receive(uv.uv_udp_t* handle,
 
     if addr is NULL:
         pyaddr = None
+    elif addr.sa_family == uv.AF_UNSPEC:
+        # https://github.com/MagicStack/uvloop/issues/304
+        IF UNAME_SYSNAME == "Linux":
+            pyaddr = None
+        ELSE:
+            pyaddr = ''
     else:
         try:
             pyaddr = __convert_sockaddr_to_pyaddr(addr)
@@ -340,13 +360,6 @@ cdef void __uv_udp_on_receive(uv.uv_udp_t* handle,
     if nread < 0:
         exc = convert_error(nread)
         udp._on_receive(None, exc, pyaddr)
-        return
-
-    if pyaddr is None:
-        udp._fatal_error(
-            RuntimeError(
-                'uv_udp.receive callback: addr is NULL and nread >= 0'),
-            False)
         return
 
     if nread == 0:

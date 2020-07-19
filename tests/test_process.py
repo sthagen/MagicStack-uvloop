@@ -135,6 +135,21 @@ class _TestProcess:
 
         self.loop.run_until_complete(test())
 
+    @unittest.skipIf(sys.version_info < (3, 8, 0),
+                     "3.5 to 3.7 does not support path-like objects "
+                     "in the asyncio subprocess API")
+    def test_process_executable_2(self):
+        async def test():
+            proc = await asyncio.create_subprocess_exec(
+                pathlib.Path(sys.executable),
+                b'-W', b'ignore', b'-c', b'print("spam")',
+                stdout=subprocess.PIPE)
+
+            out, err = await proc.communicate()
+            self.assertEqual(out, b'spam\n')
+
+        self.loop.run_until_complete(test())
+
     def test_process_pid_1(self):
         async def test():
             prog = '''\
@@ -657,6 +672,55 @@ class _AsyncioTests:
                 os.kill(pid, 0)
 
         loop.run_until_complete(test_subprocess())
+
+    def test_write_huge_stdin_8192(self):
+        self._test_write_huge_stdin(8192)
+
+    def test_write_huge_stdin_8193(self):
+        self._test_write_huge_stdin(8193)
+
+    def test_write_huge_stdin_219263(self):
+        self._test_write_huge_stdin(219263)
+
+    def test_write_huge_stdin_219264(self):
+        self._test_write_huge_stdin(219264)
+
+    def _test_write_huge_stdin(self, buf_size):
+        code = '''
+import sys
+n = 0
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        print("unexpected EOF", file=sys.stderr)
+        break
+    if line == "END\\n":
+        break
+    n+=1
+print(n)'''
+        num_lines = buf_size - len(b"END\n")
+        args = [sys.executable, b'-W', b'ignore', b'-c', code]
+
+        async def test():
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.PIPE)
+            data = b"\n" * num_lines + b"END\n"
+            self.assertEqual(len(data), buf_size)
+            proc.stdin.write(data)
+            await asyncio.wait_for(proc.stdin.drain(), timeout=1.0)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                proc.stdin.close()
+                await proc.wait()
+                raise
+            out = await proc.stdout.read()
+            self.assertEqual(int(out), num_lines)
+
+        self.loop.run_until_complete(test())
 
 
 class Test_UV_Process(_TestProcess, tb.UVTestCase):

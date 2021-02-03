@@ -23,7 +23,7 @@ Performance
 
 uvloop makes asyncio 2-4x faster.
 
-.. image:: performance.png
+.. image:: https://raw.githubusercontent.com/MagicStack/uvloop/master/performance.png
     :target: http://magic.io/blog/uvloop-blazing-fast-python-networking/
 
 The above chart shows the performance of an echo server with different
@@ -39,7 +39,7 @@ about it.
 Installation
 ------------
 
-uvloop requires Python 3.5 or greater and is available on PyPI.
+uvloop requires Python 3.7 or greater and is available on PyPI.
 Use pip to install it::
 
     $ pip install uvloop
@@ -72,7 +72,7 @@ manually creating an asyncio event loop:
 Building From Source
 --------------------
 
-To build uvloop, you'll need Python 3.5 or greater:
+To build uvloop, you'll need Python 3.7 or greater:
 
 1. Clone the repository:
 
@@ -92,7 +92,7 @@ To build uvloop, you'll need Python 3.5 or greater:
 
    ..  code::
 
-    $ pip install -r requirements.dev.txt
+    $ pip install -e .[dev]
 
 4. Build and run tests:
 

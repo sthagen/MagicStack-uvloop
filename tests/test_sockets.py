@@ -21,10 +21,6 @@ class _TestSockets:
         return buf
 
     def test_socket_connect_recv_send(self):
-        if self.is_asyncio_loop() and sys.version_info[:3] == (3, 5, 2):
-            # See https://github.com/python/asyncio/pull/366 for details.
-            raise unittest.SkipTest()
-
         if sys.version_info[:3] >= (3, 8, 0):
             # @asyncio.coroutine is deprecated in 3.8
             raise unittest.SkipTest()
@@ -195,8 +191,8 @@ class _TestSockets:
 
     def test_sock_cancel_add_reader_race(self):
         if self.is_asyncio_loop():
-            if (3, 8, 2) >= sys.version_info[:3] >= (3, 8, 0):
-                # asyncio 3.8.0 seems to have a regression;
+            if sys.version_info[:2] == (3, 8):
+                # asyncio 3.8.x has a regression; fixed in 3.9.0
                 # tracked in https://bugs.python.org/issue30064
                 raise unittest.SkipTest()
 
@@ -223,8 +219,13 @@ class _TestSockets:
             with sock_client:
                 await self.loop.sock_connect(sock_client, addr)
                 _, pending_read_futs = await asyncio.wait(
-                    [self.loop.sock_recv(sock_client, 1)],
-                    timeout=1)
+                    [
+                        asyncio.ensure_future(
+                            self.loop.sock_recv(sock_client, 1)
+                        )
+                    ],
+                    timeout=1,
+                )
 
                 async def send_server_data():
                     # Wait a little bit to let reader future cancel and
@@ -273,8 +274,13 @@ class _TestSockets:
             with sock_client:
                 await self.loop.sock_connect(sock_client, addr)
                 _, pending_read_futs = await asyncio.wait(
-                    [self.loop.sock_recv(sock_client, 1)],
-                    timeout=1)
+                    [
+                        asyncio.ensure_future(
+                            self.loop.sock_recv(sock_client, 1)
+                        )
+                    ],
+                    timeout=1,
+                )
 
                 # server can send the data in a random time, even before
                 # the previous result future has cancelled.

@@ -89,6 +89,34 @@ cdef inline socket_dec_io_ref(sock):
         sock._decref_socketios()
 
 
+cdef inline run_in_context(context, method):
+    # This method is internally used to workaround a reference issue that in
+    # certain circumstances, inlined context.run() will not hold a reference to
+    # the given method instance, which - if deallocated - will cause segault.
+    # See also: edgedb/edgedb#2222
+    Py_INCREF(method)
+    try:
+        return context.run(method)
+    finally:
+        Py_DECREF(method)
+
+
+cdef inline run_in_context1(context, method, arg):
+    Py_INCREF(method)
+    try:
+        return context.run(method, arg)
+    finally:
+        Py_DECREF(method)
+
+
+cdef inline run_in_context2(context, method, arg1, arg2):
+    Py_INCREF(method)
+    try:
+        return context.run(method, arg1, arg2)
+    finally:
+        Py_DECREF(method)
+
+
 # Used for deprecation and removal of `loop.create_datagram_endpoint()`'s
 # *reuse_address* parameter
 _unset = object()
@@ -157,7 +185,7 @@ cdef class Loop:
         self.handler_idle = UVIdle.new(
             self,
             new_MethodHandle(
-                self, "loop._on_idle", <method_t>self._on_idle, self))
+                self, "loop._on_idle", <method_t>self._on_idle, None, self))
 
         # Needed to call `UVStream._exec_write` for writes scheduled
         # during `Protocol.data_received`.
@@ -165,7 +193,7 @@ cdef class Loop:
             self,
             new_MethodHandle(
                 self, "loop._exec_queued_writes",
-                <method_t>self._exec_queued_writes, self))
+                <method_t>self._exec_queued_writes, None, self))
 
         self._signals = set()
         self._ssock = self._csock = None
@@ -288,6 +316,7 @@ cdef class Loop:
                 self,
                 "Loop._read_from_self",
                 <method_t>self._read_from_self,
+                None,
                 self))
 
         self._listening_signals = True
@@ -974,7 +1003,7 @@ cdef class Loop:
 
         if UVLOOP_DEBUG:
             if fut.cancelled():
-                # Shouldn't happen with _SyncSocketReaderFuture.
+                # Shouldn't happen with _SyncSocketWriterFuture.
                 raise RuntimeError(
                     f'_sock_sendall is called on a cancelled Future')
 
@@ -1009,6 +1038,7 @@ cdef class Loop:
                 self,
                 "Loop._sock_sendall",
                 <method3_t>self._sock_sendall,
+                None,
                 self,
                 fut, sock, data)
 
@@ -1042,13 +1072,12 @@ cdef class Loop:
         else:
             return
 
-        fut = self._new_future()
-        fut.add_done_callback(lambda fut: self._remove_writer(sock))
-
+        fut = _SyncSocketWriterFuture(sock, self)
         handle = new_MethodHandle3(
             self,
             "Loop._sock_connect",
             <method3_t>self._sock_connect_cb,
+            None,
             self,
             fut, sock, address)
 
@@ -1056,8 +1085,16 @@ cdef class Loop:
         return fut
 
     cdef _sock_connect_cb(self, fut, sock, address):
-        if fut.cancelled():
-            return
+        if UVLOOP_DEBUG:
+            if fut.cancelled():
+                # Shouldn't happen with _SyncSocketWriterFuture.
+                raise RuntimeError(
+                    f'_sock_connect_cb is called on a cancelled Future')
+
+            if not self._has_writer(sock):
+                raise RuntimeError(
+                    f'socket {sock!r} does not have a writer '
+                    f'in the _sock_connect_cb callback')
 
         try:
             err = sock.getsockopt(uv.SOL_SOCKET, uv.SO_ERROR)
@@ -1071,8 +1108,10 @@ cdef class Loop:
             raise
         except BaseException as exc:
             fut.set_exception(exc)
+            self._remove_writer(sock)
         else:
             fut.set_result(None)
+            self._remove_writer(sock)
 
     cdef _sock_set_reuseport(self, int fd):
         cdef:
@@ -1311,6 +1350,7 @@ cdef class Loop:
                 self,
                 "Loop._stop",
                 <method1_t>self._stop,
+                None,
                 self,
                 None))
 
@@ -1427,7 +1467,14 @@ cdef class Loop:
             # is no need to log the "destroy pending task" message
             future._log_destroy_pending = False
 
-        done_cb = lambda fut: self.stop()
+        def done_cb(fut):
+            if not fut.cancelled():
+                exc = fut.exception()
+                if isinstance(exc, (SystemExit, KeyboardInterrupt)):
+                    # Issue #336: run_forever() already finished,
+                    # no need to stop it.
+                    return
+            self.stop()
 
         future.add_done_callback(done_cb)
         try:
@@ -1531,8 +1578,11 @@ cdef class Loop:
                 f'sslcontext is expected to be an instance of ssl.SSLContext, '
                 f'got {sslcontext!r}')
 
-        if not isinstance(transport, (TCPTransport, UnixTransport,
-                                      _SSLProtocolTransport)):
+        if isinstance(transport, (TCPTransport, UnixTransport)):
+            context = (<UVStream>transport).context
+        elif isinstance(transport, _SSLProtocolTransport):
+            context = (<_SSLProtocolTransport>transport).context
+        else:
             raise TypeError(
                 f'transport {transport!r} is not supported by start_tls()')
 
@@ -1549,9 +1599,12 @@ cdef class Loop:
         transport.pause_reading()
 
         transport.set_protocol(ssl_protocol)
-        conmade_cb = self.call_soon(ssl_protocol.connection_made, transport)
+        conmade_cb = self.call_soon(ssl_protocol.connection_made, transport,
+                                    context=context)
+        # transport.resume_reading() will use the right context
+        # (transport.context) to call e.g. data_received()
         resume_cb = self.call_soon(transport.resume_reading)
-        app_transport = ssl_protocol._get_app_transport()
+        app_transport = ssl_protocol._get_app_transport(context)
 
         try:
             await waiter
@@ -1825,6 +1878,7 @@ cdef class Loop:
 
         app_protocol = protocol = protocol_factory()
         ssl_waiter = None
+        context = Context_CopyCurrent()
         if ssl:
             if server_hostname is None:
                 if not host:
@@ -1917,7 +1971,8 @@ cdef class Loop:
                 tr = None
                 try:
                     waiter = self._new_future()
-                    tr = TCPTransport.new(self, protocol, None, waiter)
+                    tr = TCPTransport.new(self, protocol, None, waiter,
+                                          context)
 
                     if lai is not NULL:
                         lai_iter = lai
@@ -1977,7 +2032,7 @@ cdef class Loop:
             sock.setblocking(False)
 
             waiter = self._new_future()
-            tr = TCPTransport.new(self, protocol, None, waiter)
+            tr = TCPTransport.new(self, protocol, None, waiter, context)
             try:
                 # libuv will make socket non-blocking
                 tr._open(sock.fileno())
@@ -1997,7 +2052,7 @@ cdef class Loop:
             tr._attach_fileobj(sock)
 
         if ssl:
-            app_transport = protocol._get_app_transport()
+            app_transport = protocol._get_app_transport(context)
             try:
                 await ssl_waiter
             except (KeyboardInterrupt, SystemExit):
@@ -2153,6 +2208,7 @@ cdef class Loop:
 
         app_protocol = protocol = protocol_factory()
         ssl_waiter = None
+        context = Context_CopyCurrent()
         if ssl:
             if server_hostname is None:
                 raise ValueError('You must set server_hostname '
@@ -2186,7 +2242,7 @@ cdef class Loop:
                 path = PyUnicode_EncodeFSDefault(path)
 
             waiter = self._new_future()
-            tr = UnixTransport.new(self, protocol, None, waiter)
+            tr = UnixTransport.new(self, protocol, None, waiter, context)
             tr.connect(path)
             try:
                 await waiter
@@ -2210,7 +2266,7 @@ cdef class Loop:
             sock.setblocking(False)
 
             waiter = self._new_future()
-            tr = UnixTransport.new(self, protocol, None, waiter)
+            tr = UnixTransport.new(self, protocol, None, waiter, context)
             try:
                 tr._open(sock.fileno())
                 tr._init_protocol()
@@ -2224,7 +2280,7 @@ cdef class Loop:
             tr._attach_fileobj(sock)
 
         if ssl:
-            app_transport = protocol._get_app_transport()
+            app_transport = protocol._get_app_transport(Context_CopyCurrent())
             try:
                 await ssl_waiter
             except (KeyboardInterrupt, SystemExit):
@@ -2397,6 +2453,7 @@ cdef class Loop:
             self,
             "Loop._sock_recv",
             <method3_t>self._sock_recv,
+            None,
             self,
             fut, sock, n)
 
@@ -2423,6 +2480,7 @@ cdef class Loop:
             self,
             "Loop._sock_recv_into",
             <method3_t>self._sock_recv_into,
+            None,
             self,
             fut, sock, buf)
 
@@ -2474,6 +2532,7 @@ cdef class Loop:
                 self,
                 "Loop._sock_sendall",
                 <method3_t>self._sock_sendall,
+                None,
                 self,
                 fut, sock, data)
 
@@ -2504,6 +2563,7 @@ cdef class Loop:
             self,
             "Loop._sock_accept",
             <method2_t>self._sock_accept,
+            None,
             self,
             fut, sock)
 
@@ -2569,6 +2629,7 @@ cdef class Loop:
         app_protocol = protocol_factory()
         waiter = self._new_future()
         transport_waiter = None
+        context = Context_CopyCurrent()
 
         if ssl is None:
             protocol = app_protocol
@@ -2584,10 +2645,10 @@ cdef class Loop:
 
         if sock.family == uv.AF_UNIX:
             transport = <UVStream>UnixTransport.new(
-                self, protocol, None, transport_waiter)
+                self, protocol, None, transport_waiter, context)
         elif sock.family in (uv.AF_INET, uv.AF_INET6):
             transport = <UVStream>TCPTransport.new(
-                self, protocol, None, transport_waiter)
+                self, protocol, None, transport_waiter, context)
 
         if transport is None:
             raise ValueError(
@@ -2598,7 +2659,7 @@ cdef class Loop:
         transport._attach_fileobj(sock)
 
         if ssl:
-            app_transport = protocol._get_app_transport()
+            app_transport = protocol._get_app_transport(context)
             try:
                 await waiter
             except (KeyboardInterrupt, SystemExit):

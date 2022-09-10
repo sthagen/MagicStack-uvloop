@@ -50,6 +50,7 @@ include "errors.pyx"
 
 cdef:
     int PY39 = PY_VERSION_HEX >= 0x03090000
+    int PY311 = PY_VERSION_HEX >= 0x030b0000
     uint64_t MAX_SLEEP = 3600 * 24 * 365 * 100
 
 
@@ -142,7 +143,6 @@ cdef class Loop:
 
         self._closed = 0
         self._debug = 0
-        self._thread_is_main = 0
         self._thread_id = 0
         self._running = 0
         self._stopping = 0
@@ -216,11 +216,16 @@ cdef class Loop:
         self._servers = set()
 
     cdef inline _is_main_thread(self):
-        return MAIN_THREAD_ID == PyThread_get_thread_ident()
+        cdef uint64_t main_thread_id = system.MAIN_THREAD_ID
+        if system.MAIN_THREAD_ID_SET == 0:
+            main_thread_id = <uint64_t>threading_main_thread().ident
+            system.setMainThreadID(main_thread_id)
+        return main_thread_id == PyThread_get_thread_ident()
 
     def __init__(self):
-        self.set_debug((not sys_ignore_environment
-                        and bool(os_environ.get('PYTHONASYNCIODEBUG'))))
+        self.set_debug(
+            sys_dev_mode or (not sys_ignore_environment
+                             and bool(os_environ.get('PYTHONASYNCIODEBUG'))))
 
     def __dealloc__(self):
         if self._running == 1:
@@ -520,7 +525,6 @@ cdef class Loop:
         self._last_error = None
 
         self._thread_id = PyThread_get_thread_ident()
-        self._thread_is_main = MAIN_THREAD_ID == self._thread_id
         self._running = 1
 
         self.handler_check__exec_writes.start()
@@ -541,7 +545,6 @@ cdef class Loop:
 
             self._pause_signals()
 
-            self._thread_is_main = 0
             self._thread_id = 0
             self._running = 0
             self._stopping = 0
@@ -708,7 +711,7 @@ cdef class Loop:
             return
 
         cdef uint64_t thread_id
-        thread_id = <uint64_t><int64_t>PyThread_get_thread_ident()
+        thread_id = <uint64_t>PyThread_get_thread_ident()
 
         if thread_id != self._thread_id:
             raise RuntimeError(
@@ -1412,19 +1415,35 @@ cdef class Loop:
         """Create a Future object attached to the loop."""
         return self._new_future()
 
-    def create_task(self, coro, *, name=None):
+    def create_task(self, coro, *, name=None, context=None):
         """Schedule a coroutine object.
 
         Return a task object.
 
         If name is not None, task.set_name(name) will be called if the task
         object has the set_name attribute, true for default Task in Python 3.8.
+
+        An optional keyword-only context argument allows specifying a custom
+        contextvars.Context for the coro to run in. The current context copy is
+        created when no context is provided.
         """
         self._check_closed()
-        if self._task_factory is None:
-            task = aio_Task(coro, loop=self)
+        if PY311:
+            if self._task_factory is None:
+                task = aio_Task(coro, loop=self, context=context)
+            else:
+                task = self._task_factory(self, coro, context=context)
         else:
-            task = self._task_factory(self, coro)
+            if context is None:
+                if self._task_factory is None:
+                    task = aio_Task(coro, loop=self)
+                else:
+                    task = self._task_factory(self, coro)
+            else:
+                if self._task_factory is None:
+                    task = context.run(aio_Task, coro, self)
+                else:
+                    task = context.run(self._task_factory, self, coro)
 
         # copied from asyncio.tasks._set_task_name (bpo-34270)
         if name is not None:
@@ -2604,6 +2623,18 @@ cdef class Loop:
             socket_dec_io_ref(sock)
 
     @cython.iterable_coroutine
+    async def sock_recvfrom(self, sock, bufsize):
+        raise NotImplementedError
+
+    @cython.iterable_coroutine
+    async def sock_recvfrom_into(self, sock, buf, nbytes=0):
+        raise NotImplementedError
+
+    @cython.iterable_coroutine
+    async def sock_sendto(self, sock, data, address):
+        raise NotImplementedError
+
+    @cython.iterable_coroutine
     async def connect_accepted_socket(self, protocol_factory, sock, *,
                                       ssl=None,
                                       ssl_handshake_timeout=None,
@@ -3118,6 +3149,19 @@ cdef class Loop:
         await waiter
         return udp, protocol
 
+    def _monitor_fs(self, path: str, callback) -> asyncio.Handle:
+        cdef:
+            UVFSEvent fs_handle
+            char* c_str_path
+
+        self._check_closed()
+        fs_handle = UVFSEvent.new(self, callback, None)
+        p_bytes = path.encode('UTF-8')
+        c_str_path = p_bytes
+        flags = 0
+        fs_handle.start(c_str_path, flags)
+        return fs_handle
+
     def _check_default_executor(self):
         if self._executor_shutdown_called:
             raise RuntimeError('Executor shutdown has been called')
@@ -3182,9 +3226,14 @@ cdef class Loop:
         except Exception as ex:
             self.call_soon_threadsafe(future.set_exception, ex)
 
-    # Expose pointer for integration with other C-extensions
-    def get_uv_loop_t_ptr(self):
-        return PyCapsule_New(<void *>self.uvloop, NULL, NULL)
+
+# Expose pointer for integration with other C-extensions
+def libuv_get_loop_t_ptr(loop):
+    return PyCapsule_New(<void *>(<Loop>loop).uvloop, NULL, NULL)
+
+
+def libuv_get_version():
+    return uv.uv_version()
 
 
 cdef void __loop_alloc_buffer(uv.uv_handle_t* uvhandle,
@@ -3270,6 +3319,7 @@ include "handles/streamserver.pyx"
 include "handles/tcp.pyx"
 include "handles/pipe.pyx"
 include "handles/process.pyx"
+include "handles/fsevent.pyx"
 
 include "request.pyx"
 include "dns.pyx"
@@ -3287,9 +3337,6 @@ cdef Loop __forking_loop = None
 
 
 cdef void __get_fork_handler() nogil:
-    global __forking
-    global __forking_loop
-
     with gil:
         if (__forking and __forking_loop is not None and
                 __forking_loop.active_process_handler is not None):
@@ -3297,6 +3344,7 @@ cdef void __get_fork_handler() nogil:
 
 cdef __install_atfork():
     global __atfork_installed
+
     if __atfork_installed:
         return
     __atfork_installed = 1

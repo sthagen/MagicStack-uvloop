@@ -21,18 +21,20 @@ from setuptools.command.build_ext import build_ext
 from setuptools.command.sdist import sdist
 
 
-CYTHON_DEPENDENCY = 'Cython(>=0.29.24,<0.30.0)'
+CYTHON_DEPENDENCY = 'Cython(>=0.29.32,<0.30.0)'
 
 # Minimal dependencies required to test uvloop.
 TEST_DEPENDENCIES = [
     # pycodestyle is a dependency of flake8, but it must be frozen because
     # their combination breaks too often
     # (example breakage: https://gitlab.com/pycqa/flake8/issues/427)
-    'aiohttp',
+    # aiohttp doesn't support 3.11 yet,
+    # see https://github.com/aio-libs/aiohttp/issues/6600
+    'aiohttp ; python_version < "3.11"',
     'flake8~=3.9.2',
     'psutil',
     'pycodestyle~=2.7.0',
-    'pyOpenSSL~=19.0.0',
+    'pyOpenSSL~=22.0.0',
     'mypy>=0.800',
     CYTHON_DEPENDENCY,
 ]
@@ -115,12 +117,6 @@ class uvloop_build_ext(build_ext):
     ]
 
     def initialize_options(self):
-        # initialize_options() may be called multiple times on the
-        # same command object, so make sure not to override previously
-        # set options.
-        if getattr(self, '_initialized', False):
-            return
-
         super().initialize_options()
         self.use_system_libuv = False
         self.cython_always = False
@@ -128,12 +124,6 @@ class uvloop_build_ext(build_ext):
         self.cython_directives = None
 
     def finalize_options(self):
-        # finalize_options() may be called multiple times on the
-        # same command object, so make sure not to override previously
-        # set options.
-        if getattr(self, '_initialized', False):
-            return
-
         need_cythonize = self.cython_always
         cfiles = {}
 
@@ -192,8 +182,6 @@ class uvloop_build_ext(build_ext):
                 annotate=self.cython_annotate)
 
         super().finalize_options()
-
-        self._initialized = True
 
     def build_libuv(self):
         env = _libuv_build_env()

@@ -245,7 +245,44 @@ cdef __static_getaddrinfo_pyaddr(object host, object port,
     except Exception:
         return
 
-    return af, type, proto, '', pyaddr
+    # When the host is an IP while type is one of TCP or UDP, different libc
+    # implementations of getaddrinfo() behave differently:
+    # 1. When AI_CANONNAME is set:
+    #    * glibc: returns ai_canonname
+    #    * musl: returns ai_canonname
+    #    * macOS: returns an empty string for ai_canonname
+    # 2. When AI_CANONNAME is NOT set:
+    #    * glibc: returns an empty string for ai_canonname
+    #    * musl: returns ai_canonname
+    #    * macOS: returns an empty string for ai_canonname
+    # At the same time, libuv and CPython both uses libc directly, even though
+    # this different behavior is violating what is in the documentation.
+    #
+    # uvloop potentially should be a 100% drop-in replacement for asyncio,
+    # doing whatever asyncio does, especially when the libc implementations are
+    # also different in the same way. However, making our implementation to be
+    # consistent with libc/CPython would be complex and hard to maintain
+    # (including caching libc behaviors when flag is/not set), therefore we
+    # decided to simply normalize the behavior in uvloop for this very marginal
+    # case following the documentation, even though uvloop would behave
+    # differently to asyncio on macOS and musl platforms, when again the host
+    # is an IP and type is one of TCP or UDP.
+    # All other cases are still asyncio-compatible.
+    if flags & socket_AI_CANONNAME:
+        if isinstance(host, str):
+            canon_name = host
+        else:
+            canon_name = host.decode('ascii')
+    else:
+        canon_name = ''
+
+    return (
+        _intenum_converter(af, socket_AddressFamily),
+        _intenum_converter(type, socket_SocketKind),
+        proto,
+        canon_name,
+        pyaddr,
+    )
 
 
 @cython.freelist(DEFAULT_FREELIST_SIZE)
@@ -276,8 +313,8 @@ cdef class AddrInfo:
         while ptr != NULL:
             if ptr.ai_addr.sa_family in (uv.AF_INET, uv.AF_INET6):
                 result.append((
-                    ptr.ai_family,
-                    ptr.ai_socktype,
+                    _intenum_converter(ptr.ai_family, socket_AddressFamily),
+                    _intenum_converter(ptr.ai_socktype, socket_SocketKind),
                     ptr.ai_protocol,
                     ('' if ptr.ai_canonname is NULL else
                         (<bytes>ptr.ai_canonname).decode()),
@@ -368,6 +405,13 @@ cdef class NameInfoRequest(UVRequest):
         if err < 0:
             self.on_done()
             self.callback(convert_error(err))
+
+
+cdef _intenum_converter(value, enum_klass):
+    try:
+        return enum_klass(value)
+    except ValueError:
+        return value
 
 
 cdef void __on_addrinfo_resolved(uv.uv_getaddrinfo_t *resolver,
